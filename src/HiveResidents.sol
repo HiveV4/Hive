@@ -10,7 +10,7 @@ interface IERC20Min {
 }
 
 /// @title HiveResidents
-/// @notice Resident vault. Depositing at least `MIN_DEPOSIT` HIVE opens a resident position (one illustrated bee).
+/// @notice Resident vault. Depositing at least `MIN_DEPOSIT` HIVE opens a resident position (one bee in the tree).
 ///         The deposit is backing, never burned or lent out: `leave` always returns exactly the deposited HIVE to the
 ///         position owner. Positions are deliberately non-transferable in this version (no marketplace, no transfer
 ///         accounting edge cases); one wallet may hold many positions.

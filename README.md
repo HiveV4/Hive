@@ -10,7 +10,7 @@ This repository contains the exact on-chain source of the colony, as compiled fo
 
 | Contract | What it does |
 | --- | --- |
-| [`HiveToken`](src/HiveToken.sol) | Fixed-supply ERC-20 ($HIVE, 1,000,000,000). Minted once to the treasury. No owner, no mint, no tax, no blocklist, no pause. Anyone can burn their own tokens. |
+| [`HiveToken`](src/HiveToken.sol) | Fixed-supply ERC-20 ($HIVE, 1,000,000,000). Minted once to the treasury. No owner, no mint, no tax, no blocklist, no pause. Anyone can burn their own tokens. Presentation metadata via `metadata()` and `tokenURI()` (inline JSON with description, image, website and X profile), fixed at deployment. |
 | [`HiveHook`](src/HiveHook.sol) | Uniswap v4 hook of the canonical HIVE/ETH pool. Enforces the current trading policy: buy/sell size caps, project fees, dynamic LP fee, the platform fee, and the market guards (emergency brake, storm fee, bot shield, honey hours). Rules that are stricter for traders take effect only after a public notice period, and every temporary rule expires on its own. |
 | [`HiveObserver`](src/HiveObserver.sol) | Permissionless market observation (TWAP × ETH/USD feed) for the early buy-cap floor, and validation of every policy against the hard limits. |
 | [`HiveResidents`](src/HiveResidents.sol) | Resident vault. Deposit HIVE to become a resident; `leave` always returns exactly what was deposited. Residents share ETH "honey" streamed by the treasury. |
