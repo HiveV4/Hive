@@ -12,37 +12,26 @@ interface IHiveHookObs {
     function quoteIsCurrency0() external view returns (bool);
     function observer() external view returns (address);
     function cumulativeTick() external view returns (int64 cumulative, uint32 timestamp);
-    function setFloorRelease(uint64 validUntil) external;
     function poolInitialized() external view returns (bool);
     function constitution() external view returns (Constitution memory);
-    function earlyFloorAmount() external view returns (uint256);
+    function buyFloorAmount() external view returns (uint256);
     function sellFloorAmount() external view returns (uint256);
     function baselinePolicy() external view returns (Policy memory);
 }
 
 /// @title HiveObserver
-/// @notice Conservative, permissionless market observation for the early buy-cap floor.
+/// @notice Permissionless market observation and the hook's policy rules. It reads; it never changes a trading rule.
 ///         Supply-based market cap = time-weighted HIVE price (from the hook's cumulative tick, over at least
 ///         `twapWindow`, at most `maxTwapSpan`) x quote/USD feed answer (fresh within `maxFeedAge`) x totalSupply.
 ///         This is labelled a supply-based market cap; it is not an independently verified circulating market cap.
-///         The floor is released only after the threshold has held across consecutive observations (gaps no longer
-///         than `maxObservationGap`) for `sustainPeriod`; every release is valid for `unlockValidity` only. A missing
-///         feed, stale answer, missing TWAP or below-threshold reading reinstates the floor immediately.
-///         Residual risk: in a thin pool, a well-funded actor can hold the price above the threshold for the
-///         sustain period; the only effect of a release is that the council may set buy caps below 1% of launch
-///         supply, which the next honest observation reverses.
 contract HiveObserver {
     uint8 internal constant CHECKPOINTS = 12;
 
     address public immutable deployer;
     address public immutable quoteUsdFeed;
-    uint128 public immutable thresholdUsd8;
     uint32 public immutable twapWindow;
     uint32 public immutable maxTwapSpan;
     uint32 public immutable checkpointSpacing;
-    uint32 public immutable sustainPeriod;
-    uint32 public immutable maxObservationGap;
-    uint32 public immutable unlockValidity;
     uint32 public immutable maxFeedAge;
 
     IHiveHookObs public hook;
@@ -58,13 +47,11 @@ contract HiveObserver {
     uint8 internal _head;
     uint8 internal _count;
 
-    uint64 public aboveSince;
     uint64 public lastObservationAt;
-    uint64 public releasedUntil;
     uint256 public lastMarketCapUsd8;
     bool public lastObservationValid;
 
-    event Observed(bool valid, uint256 marketCapUsd8, uint64 aboveSince, uint64 releasedUntil);
+    event Observed(bool valid, uint256 marketCapUsd8);
 
     error NotDeployer();
     error AlreadyInitialized();
@@ -74,19 +61,13 @@ contract HiveObserver {
         if (
             o.twapWindow == 0 || o.maxTwapSpan < o.twapWindow || o.checkpointSpacing == 0
                 || uint256(o.checkpointSpacing) * CHECKPOINTS < uint256(o.twapWindow) + o.checkpointSpacing
-                || o.sustainPeriod < o.twapWindow || o.maxObservationGap == 0 || o.unlockValidity == 0
-                || o.unlockValidity > o.maxObservationGap || o.unlockValidity > 1 days || o.maxFeedAge == 0
-                || o.thresholdUsd8 == 0
+                || o.maxFeedAge == 0
         ) revert BadConfig();
         deployer = msg.sender;
         quoteUsdFeed = o.quoteUsdFeed;
-        thresholdUsd8 = o.thresholdUsd8;
         twapWindow = o.twapWindow;
         maxTwapSpan = o.maxTwapSpan;
         checkpointSpacing = o.checkpointSpacing;
-        sustainPeriod = o.sustainPeriod;
-        maxObservationGap = o.maxObservationGap;
-        unlockValidity = o.unlockValidity;
         maxFeedAge = o.maxFeedAge;
     }
 
@@ -98,14 +79,14 @@ contract HiveObserver {
         hook = IHiveHookObs(hook_);
         token = IHiveHookObs(hook_).token();
         quoteIsCurrency0 = IHiveHookObs(hook_).quoteIsCurrency0();
-        // the hook's baseline must satisfy the constitution under the strictest condition (early floor active)
-        _validate(IHiveHookObs(hook_).baselinePolicy(), true);
+        // the hook's baseline must satisfy the constitution like every later policy
+        _validate(IHiveHookObs(hook_).baselinePolicy());
     }
 
     // ============================================================================================ policy rules
 
     uint8 internal constant MAX_TIERS = 3;
-    uint16 internal constant MIN_GUARD_TICKS = 500; // ≈ 5 %, mirrors HiveHook.MIN_GUARD_TICKS
+    uint16 internal constant MIN_GUARD_TICKS = 500; // ≈ 5 %, mirrors HiveHook.MIN_GUARD_TICKS (storm threshold)
     uint256 internal constant PIPS = 1_000_000;
 
     error InvalidPolicy(uint8 code);
@@ -114,24 +95,24 @@ contract HiveObserver {
     ///         InvalidPolicy(code) unless `m` satisfies the hook's constitution, and reports whether `m` is nowhere
     ///         stricter for traders than `e` and, when `e` expires, than `base`. A pure function of its inputs and the
     ///         hook's immutable constitution.
-    function checkPolicy(Policy calldata m, Policy calldata e, Policy calldata base, bool eExpires, bool floorActive)
+    function checkPolicy(Policy calldata m, Policy calldata e, Policy calldata base, bool eExpires)
         external
         view
         returns (bool relaxing)
     {
-        _validate(m, floorActive);
+        _validate(m);
         relaxing = _noStricter(m, e) && (!eExpires || _noStricter(m, base));
     }
 
-    /// @dev Codes: 1 buy cap zero, 2 buy cap below early floor, 3 sell cap below floor, 4 LP fee out of range,
-    ///      5 tier count, 6 tier order, 7 all-in ceiling exceeded, 8 fee > 100%, 9 guard threshold below
-    ///      MIN_GUARD_TICKS, 10 halt length, 11 reference window, 12 storm threshold and fee not set together,
-    ///      13 surcharge above the all-in ceiling.
-    function _validate(Policy memory p, bool floorActive) internal view {
+    /// @dev Codes: 1 buy cap zero, 2 buy cap below the permanent buy floor, 3 sell cap below floor, 4 LP fee out of
+    ///      range, 5 tier count, 6 tier order, 7 all-in ceiling exceeded, 8 fee > 100%, 9 storm threshold below
+    ///      MIN_GUARD_TICKS, 11 reference window, 12 storm threshold and fee not set together, 13 surcharge above the
+    ///      all-in ceiling. (Code 10 is unused: there is no trading halt to configure.)
+    function _validate(Policy memory p) internal view {
         Constitution memory c = hook.constitution();
         if (p.buyCapOn) {
             if (p.buyCap == 0) revert InvalidPolicy(1);
-            if (floorActive && p.buyCap < hook.earlyFloorAmount()) revert InvalidPolicy(2);
+            if (p.buyCap < hook.buyFloorAmount()) revert InvalidPolicy(2);
         }
         if (p.sellCapOn && p.sellCap < hook.sellFloorAmount()) revert InvalidPolicy(3);
         if (p.lpFee < c.minLpFeePips || p.lpFee > c.maxLpFeePips) revert InvalidPolicy(4);
@@ -151,21 +132,15 @@ contract HiveObserver {
             if (t.minQuote != 0 || t.buyFee != 0 || t.sellFee != 0) revert InvalidPolicy(5);
         }
         Guard memory g = p.guard;
-        bool brake = g.brakeDropTicks != 0 || g.brakeRiseTicks != 0;
-        if (
-            (g.brakeDropTicks != 0 && g.brakeDropTicks < MIN_GUARD_TICKS)
-                || (g.brakeRiseTicks != 0 && g.brakeRiseTicks < MIN_GUARD_TICKS)
-                || (g.stormDropTicks != 0 && g.stormDropTicks < MIN_GUARD_TICKS)
-        ) revert InvalidPolicy(9);
-        if (brake ? (g.brakeHalt == 0 || g.brakeHalt > c.maxHalt) : g.brakeHalt != 0) revert InvalidPolicy(10);
-        if (brake || g.stormDropTicks != 0 ? (g.refWindow < 60 || g.refWindow > 1 days) : g.refWindow != 0) revert InvalidPolicy(11);
+        if (g.stormDropTicks != 0 && g.stormDropTicks < MIN_GUARD_TICKS) revert InvalidPolicy(9);
+        if (g.stormDropTicks != 0 ? (g.refWindow < 60 || g.refWindow > 1 days) : g.refWindow != 0) revert InvalidPolicy(11);
         if ((g.stormDropTicks == 0) != (g.stormFee == 0)) revert InvalidPolicy(12);
         if (g.stormFee > c.maxAllInPips || g.botFee > c.maxAllInPips) revert InvalidPolicy(13);
     }
 
     /// @dev True if `a` is nowhere stricter for traders than `b`: caps at least as large (or absent), LP fee and every
-    ///      point of both fee schedules no higher, no exact-output restriction added, and no guard more sensitive,
-    ///      longer or more expensive (a changed reference window while a price guard is on counts as stricter).
+    ///      point of both fee schedules no higher, no exact-output restriction added, and no guard more sensitive or
+    ///      more expensive (a changed reference window while the storm fee is on counts as stricter).
     function _noStricter(Policy memory a, Policy memory b) internal pure returns (bool) {
         if (a.buyCapOn && (!b.buyCapOn || a.buyCap < b.buyCap)) return false;
         if (a.sellCapOn && (!b.sellCapOn || a.sellCap < b.sellCap)) return false;
@@ -181,8 +156,7 @@ contract HiveObserver {
         }
         Guard memory ga = a.guard;
         Guard memory gb = b.guard;
-        if (_tighter(ga.brakeDropTicks, gb.brakeDropTicks) || _tighter(ga.brakeRiseTicks, gb.brakeRiseTicks)) return false;
-        if (_tighter(ga.stormDropTicks, gb.stormDropTicks) || ga.brakeHalt > gb.brakeHalt) return false;
+        if (_tighter(ga.stormDropTicks, gb.stormDropTicks)) return false;
         if (ga.stormFee > gb.stormFee || ga.botFee > gb.botFee) return false;
         if (ga.refWindow != gb.refWindow && ga.refWindow != 0) return false;
         return true;
@@ -220,26 +194,14 @@ contract HiveObserver {
         if (_count < CHECKPOINTS) _count++;
     }
 
-    /// @notice Checkpoints, measures and advances the floor state machine. Permissionless.
-    /// @return floorActive whether the early buy-cap floor applies after this observation
-    function observe() external returns (bool floorActive) {
+    /// @notice Checkpoints and records a market-cap reading. Permissionless; it changes no trading rule.
+    function observe() external returns (bool valid, uint256 marketCapUsd8) {
         checkpoint();
-        (bool valid, uint256 mcap) = measureMarketCap();
-        uint64 nowTs = uint64(block.timestamp);
-        if (valid && mcap >= thresholdUsd8) {
-            if (aboveSince == 0 || nowTs - lastObservationAt > maxObservationGap) aboveSince = nowTs;
-            if (nowTs - aboveSince >= sustainPeriod) releasedUntil = nowTs + unlockValidity;
-            else releasedUntil = 0;
-        } else {
-            aboveSince = 0;
-            releasedUntil = 0;
-        }
-        lastObservationAt = nowTs;
+        (valid, marketCapUsd8) = measureMarketCap();
+        lastObservationAt = uint64(block.timestamp);
         lastObservationValid = valid;
-        lastMarketCapUsd8 = valid ? mcap : 0;
-        hook.setFloorRelease(releasedUntil);
-        emit Observed(valid, mcap, aboveSince, releasedUntil);
-        return releasedUntil < block.timestamp;
+        lastMarketCapUsd8 = valid ? marketCapUsd8 : 0;
+        emit Observed(valid, marketCapUsd8);
     }
 
     /// @notice Time-weighted average tick over the newest checkpoint that is at least `minAge` old.

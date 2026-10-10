@@ -25,15 +25,13 @@ struct Policy {
     Guard guard;
 }
 
-/// @notice Market guards. Prices are compared in ticks of the HIVE price (1 tick ≈ 0.01 %) against a reference price
-///         that is renewed at the first swap after `refWindow` seconds. A zero threshold or fee switches a guard off.
-///         Surcharges (storm, bot) are project fees: they go to the treasury and follow the council's allocation; the
-///         sum of all fees on a swap is clamped to the constitution's all-in ceiling.
+/// @notice Market guards. They only ever add a fee; nothing in the hook can halt or pause trading. Prices are compared
+///         in ticks of the HIVE price (1 tick ≈ 0.01 %) against a reference price that is renewed at the first swap
+///         after `refWindow` seconds. A zero threshold or fee switches a guard off. Surcharges (storm, bot) are project
+///         fees: they go to the treasury and follow the council's allocation; the sum of all fees on a swap is clamped
+///         to the constitution's all-in ceiling.
 struct Guard {
-    uint16 brakeDropTicks; // emergency brake: HIVE this far below the reference halts buys and sells
-    uint16 brakeRiseTicks; // emergency brake: HIVE this far above the reference halts buys and sells
-    uint32 brakeHalt; // length of a halt in seconds (<= constitution maxHalt)
-    uint32 refWindow; // reference price lifetime in seconds (required while the brake or the storm fee is on)
+    uint32 refWindow; // reference price lifetime in seconds (required while the storm fee is on)
     uint16 stormDropTicks; // storm: HIVE this far below the reference makes sells pay `stormFee` on top
     uint24 stormFee; // extra sell fee during a storm, pips
     uint24 botFee; // bot shield: extra fee on the second leg of a buy+sell by one tx.origin in one block, pips
@@ -45,22 +43,16 @@ struct Constitution {
     uint24 maxAllInPips; // ceiling for platform + project (any tier) + LP fee, additive (upper bound of compounded)
     uint24 minLpFeePips;
     uint24 maxLpFeePips;
-    uint16 earlyBuyCapFloorBps; // while the early floor is active an enabled buy cap is never below this share of launch supply
+    uint16 buyCapFloorBps; // an enabled buy cap is never below this share of launch supply, for the pool's whole life
     uint16 sellCapFloorBps; // an enabled sell cap is never below this share of launch supply
     uint32 activationDelay; // minimum notice for any change that is stricter for traders
-    uint32 maxHalt; // longest trading halt the emergency brake may impose
-    uint32 haltCooldown; // minimum gap between the end of one halt and the next trip of the brake
 }
 
-/// @notice Configuration of the supply-based market-cap observation that can release the early buy-cap floor.
+/// @notice Configuration of the supply-based market-cap observation (a reading only; it changes no trading rule).
 struct OracleConfig {
-    address quoteUsdFeed; // Chainlink-style aggregator for quote/USD; address(0) keeps the floor permanently active
-    uint128 thresholdUsd8; // supply-based market cap threshold, 8 decimals
+    address quoteUsdFeed; // Chainlink-style aggregator for quote/USD; address(0) = no market-cap reading
     uint32 twapWindow; // minimum TWAP span
     uint32 maxTwapSpan; // a TWAP over a longer span is treated as unavailable
     uint32 checkpointSpacing; // minimum spacing between stored cumulative-tick checkpoints
-    uint32 sustainPeriod; // threshold must hold across consecutive observations for this long before release
-    uint32 maxObservationGap; // a longer gap between observations restarts the sustain clock
-    uint32 unlockValidity; // a release lapses automatically this long after the last confirming observation
     uint32 maxFeedAge; // older feed answers are stale
 }

@@ -21,7 +21,7 @@ import {IHookSwapEvents} from "./interfaces/IHookSwapEvents.sol";
 
 /// @dev Policy validation and comparison, deployed in HiveObserver to keep this hook under the size limit.
 interface IPolicyRules {
-    function checkPolicy(Policy calldata m, Policy calldata e, Policy calldata base, bool eExpires, bool floorActive)
+    function checkPolicy(Policy calldata m, Policy calldata e, Policy calldata base, bool eExpires)
         external
         view
         returns (bool relaxing);
@@ -31,15 +31,16 @@ interface IPolicyRules {
 /// @notice Uniswap v4 hook for the single canonical HIVE pool. It enforces the colony's trading policy:
 ///         per-swap buy/sell size caps (in HIVE, denominated against the immutable launch supply), directional
 ///         project fees with up to three size tiers, a dynamic LP fee, the Programmable platform fee, and the market
-///         guards: an emergency brake that halts buys and sells after a sharp move, a storm surcharge on sells while
-///         the price is far below its reference, a bot-shield surcharge on same-block round trips, and honey hours
-///         (temporary lower buy fees). All fees are charged in the quote currency (native ETH on mainnet) on the
+///         guards: a storm surcharge on sells while the price is far below its reference, a bot-shield surcharge on
+///         same-block round trips, and honey hours (temporary lower buy fees). Nothing in this hook can halt or pause
+///         trading, and an enabled buy cap can never go below `buyFloorAmount` (a share of launch supply fixed at
+///         deployment). All fees are charged in the quote currency (native ETH on mainnet) on the
 ///         gross quote amount of the swap and accrue as PoolManager ERC-6909 claims held by this hook, with the
 ///         platform share kept as a separate liability that only the Programmable fee owner can claim.
 /// @dev    Hard limits (the "constitution") are immutable. The controller (an operator-run council executor) can only
-///         schedule policies that pass `_validatePolicy`; stricter policies need `activationDelay` notice; every
-///         temporary policy, halt and honey hour expires on block time without any keeper. A halt lasts at most
-///         `maxHalt` and the brake rests `haltCooldown` afterwards. The bot shield keys on tx.origin, so relayers that
+///         schedule policies that pass the observer's policy rules; stricter policies need `activationDelay` notice;
+///         every temporary policy and honey hour expires on block time without any keeper. The bot shield keys on
+///         tx.origin, so relayers that
 ///         route several users in one block can pay it on a second leg; it is a fee, never a block.
 ///         Supported routes: exact-input buys and sells always; exact-output buys and sells only while no size tiers
 ///         are active (their fee is a closed-form gross-up, see `_feeGrossUp`). Partial fills of swaps whose fee is
@@ -59,7 +60,7 @@ contract HiveHook is IHooks, IUnlockCallback, IHookSwapEvents {
     bytes32 internal constant EXTRA_TSLOT = keccak256("hive.hook.surchargePips");
     uint32 public constant MAX_HONEY_HOUR = 2 hours;
     uint32 public constant HONEY_COOLDOWN = 6 hours;
-    /// @dev ≈ 5 %: the brake and the storm never react to ordinary noise
+    /// @dev ≈ 5 %: the storm surcharge never reacts to ordinary noise
     uint16 public constant MIN_GUARD_TICKS = 500;
 
     // ------------------------------------------------------------------------------------------------ immutables
@@ -71,18 +72,16 @@ contract HiveHook is IHooks, IUnlockCallback, IHookSwapEvents {
     address public immutable programmableFeeOwner;
     int24 public immutable tickSpacing;
     uint256 public immutable launchSupply;
-    uint256 public immutable earlyFloorAmount;
+    uint256 public immutable buyFloorAmount;
     uint256 public immutable sellFloorAmount;
 
     uint24 public immutable platformFeePips;
     uint24 public immutable maxAllInPips;
     uint24 public immutable minLpFeePips;
     uint24 public immutable maxLpFeePips;
-    uint16 public immutable earlyBuyCapFloorBps;
+    uint16 public immutable buyCapFloorBps;
     uint16 public immutable sellCapFloorBps;
     uint32 public immutable activationDelay;
-    uint32 public immutable maxHalt;
-    uint32 public immutable haltCooldown;
 
     address public immutable observer;
 
@@ -106,11 +105,9 @@ contract HiveHook is IHooks, IUnlockCallback, IHookSwapEvents {
     uint64 public policyVersion;
     mapping(bytes32 => bool) public usedProposal;
 
-    // market guards: reference price (HIVE-price tick), emergency-brake halt, cooldown anchor
+    // market guards: reference price (HIVE-price tick) for the storm surcharge
     int24 public refTick;
     uint64 public refAt;
-    uint64 public haltUntil;
-    uint64 public lastHaltEnd;
     // honey hour: a short window of lower buy fees (separate capability, only ever relaxes)
     uint64 public honeyStart;
     uint64 public honeyEnd;
@@ -129,8 +126,6 @@ contract HiveHook is IHooks, IUnlockCallback, IHookSwapEvents {
     int64 internal _tickCumulative;
     uint32 internal _lastAccumulate;
 
-    // early buy-cap floor: released only by the observer, lapses on its own at `floorReleasedUntil`
-    uint64 public floorReleasedUntil;
 
     // ------------------------------------------------------------------------------------------------ events
     event ControllerSet(address indexed controller);
@@ -140,12 +135,10 @@ contract HiveHook is IHooks, IUnlockCallback, IHookSwapEvents {
         uint64 indexed version, bytes32 indexed proposalId, uint64 activatesAt, uint64 expiresAt, bytes32 policyHash
     );
     event PendingPolicyCancelled(uint64 indexed version, bytes32 indexed proposalId);
-    event BrakeTripped(uint64 haltUntil, int24 referenceTick, int24 tick);
     event HoneyHourScheduled(bytes32 indexed proposalId, uint64 startsAt, uint64 endsAt, uint24 buyFee);
     event HoneyHourCancelled(bytes32 indexed proposalId, uint64 endedAt);
     event PlatformFeesClaimed(address indexed to, uint256 amount);
     event ProjectFeesSwept(address indexed treasury, uint256 amount);
-    event FloorReleaseSet(uint64 validUntil);
 
     // ------------------------------------------------------------------------------------------------ errors
     error NotPoolManager();
@@ -165,14 +158,12 @@ contract HiveHook is IHooks, IUnlockCallback, IHookSwapEvents {
     error InvalidWindow();
     error NothingPending();
     error PendingAlreadyActive();
-    error TradingHalted(uint64 until);
     error HoneyHourInvalid(uint8 code);
     error BuyExceedsCap(uint256 amount, uint256 cap);
     error SellExceedsCap(uint256 amount, uint256 cap);
     error ExactOutputUnavailableWithTiers();
     error PartialFillUnsupported();
     error ZeroAddress();
-    error NotObserver();
 
     modifier onlyPoolManager() {
         if (msg.sender != address(poolManager)) revert NotPoolManager();
@@ -218,18 +209,16 @@ contract HiveHook is IHooks, IUnlockCallback, IHookSwapEvents {
         programmableFeeOwner = w.programmableFeeOwner;
         tickSpacing = w.tickSpacing;
         launchSupply = w.launchSupply;
-        earlyFloorAmount = w.launchSupply * c.earlyBuyCapFloorBps / BPS;
+        buyFloorAmount = w.launchSupply * c.buyCapFloorBps / BPS;
         sellFloorAmount = w.launchSupply * c.sellCapFloorBps / BPS;
 
         platformFeePips = c.platformFeePips;
         maxAllInPips = c.maxAllInPips;
         minLpFeePips = c.minLpFeePips;
         maxLpFeePips = c.maxLpFeePips;
-        earlyBuyCapFloorBps = c.earlyBuyCapFloorBps;
+        buyCapFloorBps = c.buyCapFloorBps;
         sellCapFloorBps = c.sellCapFloorBps;
         activationDelay = c.activationDelay;
-        maxHalt = c.maxHalt;
-        haltCooldown = c.haltCooldown;
 
         observer = w.observer;
 
@@ -297,7 +286,6 @@ contract HiveHook is IHooks, IUnlockCallback, IHookSwapEvents {
         bool exactIn = params.amountSpecified < 0;
         Policy storage p = _effectivePolicyRef();
 
-        if (block.timestamp < haltUntil) revert TradingHalted(haltUntil);
         if (!exactIn && p.tierCount != 0) revert ExactOutputUnavailableWithTiers();
         _tstore(EXTRA_TSLOT, _guards(p.guard, isBuy, sender));
 
@@ -360,7 +348,6 @@ contract HiveHook is IHooks, IUnlockCallback, IHookSwapEvents {
                 _emitHookSwap(sender, total, rate);
             }
         }
-        _maybeTripBrake(p.guard, sender);
         return (IHooks.afterSwap.selector, unspecifiedFee);
     }
 
@@ -495,7 +482,7 @@ contract HiveHook is IHooks, IUnlockCallback, IHookSwapEvents {
         (Policy storage e, uint8 source) = _effectivePolicyRefWithSource();
         bool eExpires = source == SOURCE_BASELINE ? false : (source == SOURCE_CURRENT ? currentExpiresAt != 0 : pendingExpiresAt != 0);
         // validation (reverts InvalidPolicy) and the stricter/relaxing comparison live in the observer
-        bool relaxing = IPolicyRules(observer).checkPolicy(p, e, _baseline, eExpires, earlyFloorActive());
+        bool relaxing = IPolicyRules(observer).checkPolicy(p, e, _baseline, eExpires);
         if (!relaxing && activatesAt < block.timestamp + activationDelay) {
             revert ActivationTooSoon(activatesAt, uint64(block.timestamp + activationDelay));
         }
@@ -551,20 +538,6 @@ contract HiveHook is IHooks, IUnlockCallback, IHookSwapEvents {
 
     // ============================================================================================ observation
 
-    /// @notice Set by the observer only: releases the early buy-cap floor until `validUntil` (0 reinstates it).
-    ///         A release can never be longer than one day ahead and lapses by itself without any keeper.
-    function setFloorRelease(uint64 validUntil) external {
-        if (msg.sender != observer) revert NotObserver();
-        if (validUntil > block.timestamp + 1 days) revert InvalidWindow();
-        floorReleasedUntil = validUntil;
-        emit FloorReleaseSet(validUntil);
-    }
-
-    /// @notice True while every enabled buy cap is held at or above `earlyFloorAmount`.
-    function earlyFloorActive() public view returns (bool) {
-        return block.timestamp > floorReleasedUntil;
-    }
-
     /// @notice Cumulative time-weighted tick up to now (for TWAPs computed by the observer).
     function cumulativeTick() external view returns (int64 cumulative, uint32 timestamp) {
         if (!poolInitialized) revert PoolNotBound();
@@ -591,15 +564,11 @@ contract HiveHook is IHooks, IUnlockCallback, IHookSwapEvents {
         expiresAt = source == SOURCE_CURRENT ? currentExpiresAt : (source == SOURCE_PENDING ? pendingExpiresAt : 0);
     }
 
-    /// @notice Effective per-swap buy cap right now: (enabled, amount). Includes the early floor.
+    /// @notice Effective per-swap buy cap right now: (enabled, amount). Never below `buyFloorAmount`.
     function effectiveBuyCap() external view returns (bool enabled, uint256 amount) {
         Policy storage p = _effectivePolicyRef();
         if (!p.buyCapOn) return (false, type(uint256).max);
         return (true, _effectiveBuyCap(p.buyCap));
-    }
-
-    function tradingHalted() external view returns (bool) {
-        return block.timestamp < haltUntil;
     }
 
     function honeyHourActive() public view returns (bool) {
@@ -626,11 +595,9 @@ contract HiveHook is IHooks, IUnlockCallback, IHookSwapEvents {
             maxAllInPips: maxAllInPips,
             minLpFeePips: minLpFeePips,
             maxLpFeePips: maxLpFeePips,
-            earlyBuyCapFloorBps: earlyBuyCapFloorBps,
+            buyCapFloorBps: buyCapFloorBps,
             sellCapFloorBps: sellCapFloorBps,
-            activationDelay: activationDelay,
-            maxHalt: maxHalt,
-            haltCooldown: haltCooldown
+            activationDelay: activationDelay
         });
     }
 
@@ -723,9 +690,9 @@ contract HiveHook is IHooks, IUnlockCallback, IHookSwapEvents {
         else emit HookSwap(poolId, sender, 0, paid, rate);
     }
 
+    /// @dev The policy rules already refuse caps below the floor; this keeps the floor even for a stored policy.
     function _effectiveBuyCap(uint128 cap) internal view returns (uint256) {
-        if (cap < earlyFloorAmount && earlyFloorActive()) return earlyFloorAmount;
-        return cap;
+        return cap < buyFloorAmount ? buyFloorAmount : cap;
     }
 
     function _tstore(bytes32 slot, uint256 v) internal {
@@ -768,22 +735,6 @@ contract HiveHook is IHooks, IUnlockCallback, IHookSwapEvents {
             _lastLeg[tx.origin] = (block.number << 1) | side;
         }
         if (sender == treasury) extra = 0;
-    }
-
-    /// @dev After a swap: trips the emergency brake when the price left the reference band; buys and sells then
-    ///      revert until `haltUntil`. The brake rests for `haltCooldown` after a halt and takes a fresh reference.
-    function _maybeTripBrake(Guard storage g, address sender) internal {
-        if (g.brakeDropTicks == 0 && g.brakeRiseTicks == 0) return;
-        if (sender == treasury || refAt == 0 || block.timestamp < uint256(lastHaltEnd) + haltCooldown) return;
-        int256 h = _hiveTick();
-        int256 d = h - refTick;
-        if ((g.brakeDropTicks != 0 && -d >= int256(uint256(g.brakeDropTicks))) || (g.brakeRiseTicks != 0 && d >= int256(uint256(g.brakeRiseTicks)))) {
-            uint64 until = uint64(block.timestamp) + g.brakeHalt;
-            haltUntil = until;
-            lastHaltEnd = until;
-            emit BrakeTripped(until, refTick, int24(h));
-            refAt = 0;
-        }
     }
 
     // ============================================================================================ internals: policy
@@ -842,12 +793,9 @@ contract HiveHook is IHooks, IUnlockCallback, IHookSwapEvents {
             revert InvalidConstitution(3);
         }
         if (c.minLpFeePips > c.maxLpFeePips || c.maxLpFeePips > LPFeeLibrary.MAX_LP_FEE) revert InvalidConstitution(4);
-        if (c.earlyBuyCapFloorBps < 100 || c.earlyBuyCapFloorBps > BPS) revert InvalidConstitution(5); // >= 1%
+        if (c.buyCapFloorBps < 100 || c.buyCapFloorBps > BPS) revert InvalidConstitution(5); // >= 1%
         if (c.sellCapFloorBps < 10 || c.sellCapFloorBps > BPS) revert InvalidConstitution(6); // >= 0.1%
         if (c.activationDelay < 60) revert InvalidConstitution(7);
-        if (c.maxHalt == 0 || c.maxHalt > 1 hours || c.haltCooldown < 2 * uint256(c.maxHalt)) {
-            revert InvalidConstitution(8);
-        }
     }
 
     // ============================================================================================ internals: oracle

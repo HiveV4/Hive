@@ -11,10 +11,19 @@ This repository contains the exact on-chain source of the colony, as compiled fo
 | Contract | What it does |
 | --- | --- |
 | [`HiveToken`](src/HiveToken.sol) | Fixed-supply ERC-20 ($HIVE, 1,000,000,000). Minted once to the treasury. No owner, no mint, no tax, no blocklist, no pause. Anyone can burn their own tokens. Presentation metadata via `metadata()` and `tokenURI()` (inline JSON with description, image, website and X profile), fixed at deployment. |
-| [`HiveHook`](src/HiveHook.sol) | Uniswap v4 hook of the canonical HIVE/ETH pool. Enforces the current trading policy: buy/sell size caps, project fees, dynamic LP fee, the platform fee, and the market guards (emergency brake, storm fee, bot shield, honey hours). Rules that are stricter for traders take effect only after a public notice period, and every temporary rule expires on its own. |
-| [`HiveObserver`](src/HiveObserver.sol) | Permissionless market observation (TWAP × ETH/USD feed) for the early buy-cap floor, and validation of every policy against the hard limits. |
+| [`HiveHook`](src/HiveHook.sol) | Uniswap v4 hook of the canonical HIVE/ETH pool. Enforces the current trading policy: buy/sell size caps, project fees, dynamic LP fee, the platform fee, and the market guards (storm fee, bot shield, honey hours). Rules that are stricter for traders take effect only after a public notice period, and every temporary rule expires on its own. |
+| [`HiveObserver`](src/HiveObserver.sol) | Permissionless market observation (TWAP × ETH/USD feed, a reading only) and validation of every policy against the hard limits. |
 | [`HiveResidents`](src/HiveResidents.sol) | Resident vault. Deposit HIVE to become a resident; `leave` always returns exactly what was deposited. Residents share ETH "honey" streamed by the treasury. |
 | [`HiveTreasury`](src/HiveTreasury.sol) | The colony pantry. Initializes and seeds the pool (liquidity is permanently locked — there is no function that removes it), splits income into budgets and spends only through bounded actions: buybacks, burns, liquidity growth, honey, and rate-limited operations payouts. |
+
+### Trading can never be halted, and buys can never be blocked
+
+- There is no halt, pause or circuit breaker anywhere in these contracts. The market guards only add a fee (storm fee
+  on sells far below the reference price, bot-shield fee on same-block round trips); a swap is never refused because of
+  price movement.
+- An enabled buy cap can never be set below 1% of the launch supply (`Constitution.buyCapFloorBps`, fixed at
+  deployment, read back as `HiveHook.buyFloorAmount`). The policy rules refuse anything lower, and the hook applies the
+  floor again on every swap. There is no way to lift it.
 
 ### Launch buy
 
